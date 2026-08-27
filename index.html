@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Vibe Fight Club</title>
+<style>
+  body { background: #111; color: #eee; font-family: system-ui, sans-serif; text-align: center; }
+  #arena { background: #222; border: 2px solid #555; margin: 10px auto; display: block; }
+  #hud { display: flex; justify-content: center; gap: 40px; margin: 10px; }
+  .bar-wrap { width: 220px; }
+  .bar-bg { background: #333; border-radius: 6px; height: 18px; overflow: hidden; }
+  .bar-fill { height: 100%; transition: width 0.1s linear; }
+  #p1fill { background: #4da6ff; }
+  #p2fill { background: #ff5c5c; }
+  select, button { font-size: 16px; padding: 6px 10px; margin: 4px; }
+  #log { max-width: 640px; margin: 10px auto; font-size: 14px; color: #aaa; height: 80px; overflow-y: auto; text-align: left; }
+</style>
+</head>
+<body>
+<h1>🥊 Vibe Fight Club</h1>
+<p>Pick two bots and hit Fight. To add your own bot, scroll to the
+<code>BOT_REGISTRY.push(...)</code> section at the bottom of this file's
+script and add another push — see README.md.</p>
+
+<div>
+  <select id="p1select"></select>
+  vs
+  <select id="p2select"></select>
+  <button id="fightBtn">Fight!</button>
+  <button id="resetBtn">Reset</button>
+</div>
+
+<div id="hud">
+  <div class="bar-wrap">
+    <div id="p1name">Player 1</div>
+    <div class="bar-bg"><div class="bar-fill" id="p1fill" style="width:100%"></div></div>
+  </div>
+  <div class="bar-wrap">
+    <div id="p2name">Player 2</div>
+    <div class="bar-bg"><div class="bar-fill" id="p2fill" style="width:100%"></div></div>
+  </div>
+</div>
+
+<canvas id="arena" width="800" height="450"></canvas>
+<div id="log"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/matter-js@0.19.0/build/matter.min.js"></script>
+
+<script>
+/* ============================================================
+   BOT REGISTRY
+   Add your own bot by copying one of the two examples below and
+   pushing another object into BOT_REGISTRY. No other file needs
+   to change — it's all in this one script tag.
+   ============================================================ */
+const BOT_REGISTRY = [];
+
+// --- Example 1: humanoid puncher ------------------------------
+BOT_REGISTRY.push({
+  name: 'Brawler',
+
+  create(Matter, x) {
+    const torso = Matter.Bodies.rectangle(x, 300, 40, 80, { label: 'torso', density: 0.01 });
+    const arm = Matter.Bodies.rectangle(x + 35, 300, 50, 14, { label: 'arm', density: 0.005 });
+
+    const shoulder = Matter.Constraint.create({
+      bodyA: torso, pointA: { x: 15, y: -20 },
+      bodyB: arm, pointB: { x: -20, y: 0 },
+      stiffness: 0.6, length: 5,
+    });
+
+    return {
+      parts: [torso, arm],
+      constraints: [shoulder],
+      main: torso,
+    };
+  },
+
+  control({ Matter, self, opponent }) {
+    const torso = self.parts[0];
+    const arm = self.parts[1];
+    const oppX = opponent.main.position.x;
+    const dx = oppX - torso.position.x;
+    const dist = Math.abs(dx);
+
+    const walkForce = 0.0006 * Math.sign(dx);
+    Matter.Body.applyForce(torso, torso.position, { x: walkForce, y: 0 });
+
+    if (dist < 90) {
+      Matter.Body.applyForce(arm, arm.position, { x: 0.002 * Math.sign(dx), y: -0.0006 });
+    }
+
+    Matter.Body.setAngularVelocity(torso, torso.angularVelocity * 0.9);
+  },
+});
+
+// --- Example 2: non-humanoid spinner --------------------------
+BOT_REGISTRY.push({
+  name: 'Spinner',
+
+  create(Matter, x) {
+    const core = Matter.Bodies.circle(x, 300, 22, { label: 'core', density: 0.02 });
+    const blade = Matter.Bodies.rectangle(x, 300, 70, 8, { label: 'blade', density: 0.01, friction: 0.02 });
+
+    const pivot = Matter.Constraint.create({
+      bodyA: core, pointA: { x: 0, y: 0 },
+      bodyB: blade, pointB: { x: 0, y: 0 },
+      stiffness: 1, length: 0,
+    });
+
+    return {
+      parts: [core, blade],
+      constraints: [pivot],
+      main: core,
+    };
+  },
+
+  control({ Matter, self, opponent }) {
+    const core = self.parts[0];
+    const blade = self.parts[1];
+    const dx = opponent.main.position.x - core.position.x;
+
+    Matter.Body.applyForce(core, core.position, { x: 0.0005 * Math.sign(dx), y: 0 });
+    Matter.Body.setAngularVelocity(blade, 0.9);
+  },
+});
+
+// --- Add more bots here: BOT_REGISTRY.push({ name, create, control }) ---
+
+
+/* ============================================================
+   ENGINE — the fight-club "referee". Wraps Matter.js: spawns two
+   bots, runs the physics loop, applies damage, calls each bot's
+   control() every tick.
+   ============================================================ */
+const ARENA_W = 800;
+const ARENA_H = 450;
+const FLOOR_Y = ARENA_H - 30;
+const TICK_MS = 1000 / 60;
+const MAX_HP = 100;
+const MATCH_TIME_S = 60;
+
+class Fight {
+  constructor(botDefA, botDefB, canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d');
+
+    this.engine = Matter.Engine.create();
+    this.engine.gravity.y = 1;
+    this.world = this.engine.world;
+
+    this.buildArena();
+
+    this.botA = this.spawnBot(botDefA, 200, 'A');
+    this.botB = this.spawnBot(botDefB, 600, 'B');
+
+    this.timeLeft = MATCH_TIME_S;
+    this.running = false;
+    this.winner = null;
+    this.onLog = () => {};
+    this.onUpdate = () => {};
+
+    Matter.Events.on(this.engine, 'collisionStart', (evt) => this.handleCollisions(evt));
+  }
+
+  buildArena() {
+    const floor = Matter.Bodies.rectangle(ARENA_W / 2, FLOOR_Y + 15, ARENA_W, 30, { isStatic: true, label: 'floor' });
+    const leftWall = Matter.Bodies.rectangle(-10, ARENA_H / 2, 20, ARENA_H, { isStatic: true, label: 'wall' });
+    const rightWall = Matter.Bodies.rectangle(ARENA_W + 10, ARENA_H / 2, 20, ARENA_H, { isStatic: true, label: 'wall' });
+    Matter.World.add(this.world, [floor, leftWall, rightWall]);
+  }
+
+  spawnBot(botDef, x, side) {
+    const built = botDef.create(Matter, x);
+    Matter.World.add(this.world, built.parts);
+    if (built.constraints) Matter.World.add(this.world, built.constraints);
+    built.parts.forEach(p => { p.botSide = side; p.botHP = MAX_HP; });
+    return {
+      def: botDef,
+      side,
+      parts: built.parts,
+      main: built.main || built.parts[0],
+      hp: MAX_HP,
+      alive: true,
+    };
+  }
+
+  handleCollisions(evt) {
+    for (const pair of evt.pairs) {
+      const { bodyA, bodyB } = pair;
+      if (bodyA.botSide && bodyB.botSide && bodyA.botSide !== bodyB.botSide) {
+        const relVel = Matter.Vector.sub(bodyA.velocity, bodyB.velocity);
+        const speed = Matter.Vector.magnitude(relVel);
+        const dmg = Math.min(15, speed * 1.2);
+        if (dmg > 0.5) {
+          this.applyDamage(bodyA.botSide === 'A' ? this.botB : this.botA, dmg);
+        }
+      }
+    }
+  }
+
+  applyDamage(bot, dmg) {
+    bot.hp = Math.max(0, bot.hp - dmg);
+    if (dmg > 3) this.onLog(`${bot.def.name} takes ${dmg.toFixed(1)} dmg (HP ${bot.hp.toFixed(0)})`);
+  }
+
+  start() {
+    this.running = true;
+    this.loop();
+  }
+
+  loop() {
+    if (!this.running) return;
+
+    this.tickBot(this.botA, this.botB);
+    this.tickBot(this.botB, this.botA);
+
+    Matter.Engine.update(this.engine, TICK_MS);
+
+    [this.botA, this.botB].forEach(bot => {
+      const y = bot.main.position.y;
+      if (y > ARENA_H + 100) { bot.hp = 0; }
+    });
+
+    this.timeLeft -= TICK_MS / 1000;
+
+    this.render();
+    this.onUpdate(this.botA, this.botB, this.timeLeft);
+
+    if (this.botA.hp <= 0 || this.botB.hp <= 0 || this.timeLeft <= 0) {
+      this.endMatch();
+      return;
+    }
+
+    requestAnimationFrame(() => this.loop());
+  }
+
+  endMatch() {
+    this.running = false;
+    if (this.botA.hp <= 0 && this.botB.hp <= 0) this.winner = 'Draw';
+    else if (this.botA.hp <= 0) this.winner = this.botB.def.name;
+    else if (this.botB.hp <= 0) this.winner = this.botA.def.name;
+    else this.winner = this.botA.hp >= this.botB.hp ? this.botA.def.name : this.botB.def.name;
+    this.onLog(`🏆 Winner: ${this.winner}`);
+  }
+
+  tickBot(self, opp) {
+    if (!self.def.control) return;
+    try {
+      self.def.control({
+        Matter,
+        engine: this.engine,
+        self,
+        opponent: opp,
+        arena: { w: ARENA_W, h: ARENA_H, floorY: FLOOR_Y },
+      });
+    } catch (e) {
+      console.error(`${self.def.name} control() error:`, e);
+    }
+  }
+
+  render() {
+    const ctx = this.ctx;
+    ctx.clearRect(0, 0, ARENA_W, ARENA_H);
+
+    ctx.fillStyle = '#333';
+    ctx.fillRect(0, FLOOR_Y, ARENA_W, ARENA_H - FLOOR_Y);
+
+    [this.botA, this.botB].forEach(bot => {
+      ctx.fillStyle = bot.side === 'A' ? '#4da6ff' : '#ff5c5c';
+      bot.parts.forEach(part => this.drawBody(part));
+    });
+  }
+
+  drawBody(body) {
+    const ctx = this.ctx;
+    const vertices = body.vertices;
+    ctx.beginPath();
+    ctx.moveTo(vertices[0].x, vertices[0].y);
+    for (let i = 1; i < vertices.length; i++) ctx.lineTo(vertices[i].x, vertices[i].y);
+    ctx.closePath();
+    ctx.fill();
+  }
+}
+
+
+/* ============================================================
+   UI WIRING
+   ============================================================ */
+const canvas = document.getElementById('arena');
+const p1select = document.getElementById('p1select');
+const p2select = document.getElementById('p2select');
+const fightBtn = document.getElementById('fightBtn');
+const resetBtn = document.getElementById('resetBtn');
+const logEl = document.getElementById('log');
+const p1fill = document.getElementById('p1fill');
+const p2fill = document.getElementById('p2fill');
+const p1name = document.getElementById('p1name');
+const p2name = document.getElementById('p2name');
+
+let currentFight = null;
+
+function populateSelects() {
+  BOT_REGISTRY.forEach((bot, i) => {
+    p1select.add(new Option(bot.name, i));
+    p2select.add(new Option(bot.name, i));
+  });
+  if (BOT_REGISTRY.length > 1) p2select.selectedIndex = 1;
+}
+
+function log(msg) {
+  const line = document.createElement('div');
+  line.textContent = msg;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function startFight() {
+  logEl.innerHTML = '';
+  const defA = BOT_REGISTRY[p1select.value];
+  const defB = BOT_REGISTRY[p2select.value];
+  p1name.textContent = defA.name;
+  p2name.textContent = defB.name;
+
+  currentFight = new Fight(defA, defB, canvas);
+  currentFight.onLog = log;
+  currentFight.onUpdate = (botA, botB) => {
+    p1fill.style.width = `${(botA.hp / 100) * 100}%`;
+    p2fill.style.width = `${(botB.hp / 100) * 100}%`;
+  };
+  currentFight.start();
+  log(`${defA.name} vs ${defB.name} — fight!`);
+}
+
+fightBtn.addEventListener('click', startFight);
+resetBtn.addEventListener('click', () => {
+  if (currentFight) currentFight.running = false;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  p1fill.style.width = '100%';
+  p2fill.style.width = '100%';
+  logEl.innerHTML = '';
+});
+
+populateSelects();
+</script>
+</body>
+</html>
